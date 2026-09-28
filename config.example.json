@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "repoPath": "~/Projects/labbook",
+  "recordsDir": "records",
+  "remote": "origin",
+  "branch": "main",
+  "expectedRemote": "https://github.com/OWNER/labbook.git",
+  "publishMode": "confirm",
+  "secretScan": true
+}

@@ -1,0 +1,54 @@
+{
+  "name": "pi-labbook",
+  "version": "0.1.0",
+  "description": "Branch-aware lab notes, memory, and experiment records for Pi with GitHub publishing",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "labbook",
+    "notes",
+    "memory",
+    "experiments",
+    "git"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zlflly/pi-labbook.git"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "config.example.json"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": ">=0.87.1",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.87.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/pi-tui": "0.87.1",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typebox": "^1.0.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
