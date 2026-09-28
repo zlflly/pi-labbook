@@ -1,6 +1,6 @@
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import type { LabbookConfig } from "./config.js";
 import { resolveContainedPath, scanSecrets } from "./record.js";
 
@@ -30,15 +30,37 @@ function normalizeRemote(value: string): string {
 		.replace(/\/$/, "");
 }
 
+export function sanitizeRemoteForDisplay(value: string): string {
+	return redact(value).replace(/([?&](?:token|access_token|auth)=)[^&\s]+/gi, "$1[REDACTED]");
+}
+
+function assertRemoteHasNoEmbeddedCredentials(value: string): void {
+	if (/^https?:\/\//i.test(value)) {
+		const parsed = new URL(value);
+		if (parsed.username || parsed.password || [...parsed.searchParams.keys()].some((key) => /token|auth|key/i.test(key))) {
+			throw new Error("Credential-bearing Git remote URLs are not allowed; use gh auth, a credential helper, or SSH agent");
+		}
+	}
+	if (/\b(?:gh[pousr]_|github_pat_)/i.test(value)) {
+		throw new Error("Credential-bearing Git remote URLs are not allowed");
+	}
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (signal?.aborted) throw new Error("Labbook publication was aborted");
+}
+
 async function runGit(
 	pi: Pick<ExtensionAPI, "exec">,
 	cwd: string,
 	args: string[],
 	timeout = 60_000,
+	signal?: AbortSignal,
 ): Promise<string> {
 	const result = await pi.exec("git", ["-c", "credential.interactive=false", ...args], {
 		cwd,
 		timeout,
+		signal,
 	});
 	if (result.code !== 0) {
 		const detail = redact((result.stderr || result.stdout || `git ${args[0]} failed`).trim());
@@ -52,7 +74,8 @@ function ensureNoSymlinkPath(root: string, destination: string): void {
 	let cursor = root;
 	for (const part of rel.split(sep).slice(0, -1)) {
 		cursor = resolve(cursor, part);
-		if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) {
+		if (!existsSync(cursor)) break;
+		if (lstatSync(cursor).isSymbolicLink()) {
 			throw new Error(`Refusing symlinked record directory: ${cursor}`);
 		}
 	}
@@ -80,22 +103,50 @@ function acquireLock(repoRoot: string): { path: string; fd: number } {
 export async function inspectRepository(
 	pi: Pick<ExtensionAPI, "exec">,
 	config: LabbookConfig,
-): Promise<{ root: string; remoteUrl: string; branch: string; clean: boolean }> {
+	signal?: AbortSignal,
+): Promise<{ root: string; remoteUrl: string; pushUrls: string[]; branch: string; clean: boolean }> {
+	throwIfAborted(signal);
 	if (!existsSync(config.repoPath)) throw new Error(`Labbook repository does not exist: ${config.repoPath}`);
 	const root = realpathSync(config.repoPath);
-	const top = realpathSync(await runGit(pi, root, ["rev-parse", "--show-toplevel"]));
+	const top = realpathSync(await runGit(pi, root, ["rev-parse", "--show-toplevel"], 60_000, signal));
 	if (top !== root) throw new Error(`Configured repoPath is not the Git repository root: ${root}`);
-	const branch = await runGit(pi, root, ["branch", "--show-current"]);
-	const remoteUrl = await runGit(pi, root, ["remote", "get-url", config.remote]);
-	const status = await runGit(pi, root, ["status", "--porcelain=v1", "--untracked-files=all"]);
-	return { root, remoteUrl, branch, clean: status.length === 0 };
+	const branch = await runGit(pi, root, ["branch", "--show-current"], 60_000, signal);
+	const remoteUrl = await runGit(pi, root, ["remote", "get-url", config.remote], 60_000, signal);
+	const pushUrls = (await runGit(pi, root, ["remote", "get-url", "--push", "--all", config.remote], 60_000, signal))
+		.split("\n")
+		.map((item) => item.trim())
+		.filter(Boolean);
+	assertRemoteHasNoEmbeddedCredentials(remoteUrl);
+	for (const pushUrl of pushUrls) assertRemoteHasNoEmbeddedCredentials(pushUrl);
+	const status = await runGit(pi, root, ["status", "--porcelain=v1", "--untracked-files=all"], 60_000, signal);
+	return { root, remoteUrl, pushUrls, branch, clean: status.length === 0 };
 }
 
-export async function publishRecord(
+function assertExpectedRemote(
+	config: LabbookConfig,
+	repository: { remoteUrl: string; pushUrls: string[] },
+): void {
+	if (config.publishMode !== "local-only" && !config.expectedRemote) {
+		throw new Error("expectedRemote is required when GitHub publishing is enabled");
+	}
+	if (!config.expectedRemote) return;
+	const expected = normalizeRemote(config.expectedRemote);
+	const actual = [repository.remoteUrl, ...repository.pushUrls];
+	for (const url of actual) {
+		if (normalizeRemote(url) !== expected) {
+			throw new Error(
+				`Remote mismatch: expected ${sanitizeRemoteForDisplay(config.expectedRemote)}, got ${sanitizeRemoteForDisplay(url)}`,
+			);
+		}
+	}
+}
+
+async function publishRecordUnlocked(
 	pi: Pick<ExtensionAPI, "exec">,
 	ctx: ExtensionContext,
 	config: LabbookConfig,
 	input: PublishInput,
+	signal?: AbortSignal,
 ): Promise<PublishResult> {
 	if (!ctx.hasUI && config.publishMode === "confirm") {
 		throw new Error("Publishing requires an interactive confirmation UI");
@@ -108,25 +159,27 @@ export async function publishRecord(
 		}
 	}
 
-	const initial = await inspectRepository(pi, config);
+	throwIfAborted(signal);
+	const initial = await inspectRepository(pi, config, signal);
 	if (!initial.clean) throw new Error(`Labbook repository has uncommitted changes: ${initial.root}`);
 	if (initial.branch !== config.branch) {
 		throw new Error(`Labbook repository is on branch '${initial.branch}', expected '${config.branch}'`);
 	}
-	if (config.expectedRemote && normalizeRemote(initial.remoteUrl) !== normalizeRemote(config.expectedRemote)) {
-		throw new Error(`Remote mismatch: expected ${normalizeRemote(config.expectedRemote)}, got ${normalizeRemote(initial.remoteUrl)}`);
-	}
+	assertExpectedRemote(config, initial);
 
 	const lock = acquireLock(initial.root);
 	try {
-		await runGit(pi, initial.root, ["pull", "--ff-only", config.remote, config.branch], 120_000);
-		const afterPull = await inspectRepository(pi, config);
+		await runGit(pi, initial.root, ["pull", "--ff-only", config.remote, config.branch], 120_000, signal);
+		const afterPull = await inspectRepository(pi, config, signal);
 		if (!afterPull.clean || afterPull.branch !== config.branch) {
 			throw new Error("Repository changed during synchronization; refusing to publish");
 		}
+		assertExpectedRemote(config, afterPull);
+		throwIfAborted(signal);
 
 		const relativePath = recordPathForConfig(config, input.relativePath);
 		const destination = resolveContainedPath(initial.root, relativePath);
+		ensureNoSymlinkPath(initial.root, destination);
 		mkdirSync(dirname(destination), { recursive: true });
 		ensureNoSymlinkPath(initial.root, destination);
 		const parentReal = realpathSync(dirname(destination));
@@ -140,37 +193,46 @@ export async function publishRecord(
 				: input.markdown;
 			const confirmed = await ctx.ui.confirm(
 				"Publish labbook record?",
-				`Repository: ${initial.root}\nRemote: ${normalizeRemote(initial.remoteUrl)}\nBranch: ${config.branch}\nFile: ${relativePath}\n\n${preview}`,
+				`Repository: ${initial.root}\nPush remote: ${afterPull.pushUrls.map(sanitizeRemoteForDisplay).join(", ")}\nBranch: ${config.branch}\nFile: ${relativePath}\n\n${preview}`,
+				{ signal },
 			);
 			if (!confirmed) return { status: "declined" };
 		}
+		throwIfAborted(signal);
 
 		const temp = `${destination}.tmp-${process.pid}-${Date.now()}`;
 		let committed = false;
 		try {
 			writeFileSync(temp, input.markdown, { encoding: "utf8", mode: 0o600, flag: "wx" });
+			throwIfAborted(signal);
 			renameSync(temp, destination);
-			await runGit(pi, initial.root, ["add", "--", relativePath]);
-			const staged = (await runGit(pi, initial.root, ["diff", "--cached", "--name-only", "--"])).split("\n").filter(Boolean);
+			await runGit(pi, initial.root, ["add", "--", relativePath], 60_000, signal);
+			const staged = (await runGit(pi, initial.root, ["diff", "--cached", "--name-only", "--"], 60_000, signal)).split("\n").filter(Boolean);
 			if (staged.length !== 1 || staged[0] !== relativePath) {
 				throw new Error(`Unexpected staged paths: ${staged.join(", ") || "none"}`);
 			}
 			const message = `labbook: ${input.title}`;
+			throwIfAborted(signal);
 			await runGit(pi, initial.root, [
 				"commit",
 				"-m",
 				message,
 				"-m",
 				`Pi-Labbook-ID: ${input.labId}\nPi-Session-ID: ${input.sessionId}`,
-			]);
+			], 60_000, signal);
 			committed = true;
 			const commit = await runGit(pi, initial.root, ["rev-parse", "HEAD"]);
 
 			if (config.publishMode === "local-only") {
 				return { status: "saved", relativePath, commit, pushed: false };
 			}
+			if (signal?.aborted) {
+				return { status: "saved", relativePath, commit, pushed: false, pushError: "Publication was aborted after the local commit" };
+			}
 			try {
-				await runGit(pi, initial.root, ["push", config.remote, `HEAD:refs/heads/${config.branch}`], 120_000);
+				const beforePush = await inspectRepository(pi, config, signal);
+				assertExpectedRemote(config, beforePush);
+				await runGit(pi, initial.root, ["push", config.remote, `HEAD:refs/heads/${config.branch}`], 120_000, signal);
 				return { status: "saved", relativePath, commit, pushed: true };
 			} catch (error) {
 				return {
@@ -191,6 +253,16 @@ export async function publishRecord(
 		}
 	} finally {
 		closeSync(lock.fd);
-		unlinkSync(lock.path);
+		if (existsSync(lock.path)) unlinkSync(lock.path);
 	}
+}
+
+export async function publishRecord(
+	pi: Pick<ExtensionAPI, "exec">,
+	ctx: ExtensionContext,
+	config: LabbookConfig,
+	input: PublishInput,
+	signal?: AbortSignal,
+): Promise<PublishResult> {
+	return withFileMutationQueue(config.repoPath, () => publishRecordUnlocked(pi, ctx, config, input, signal));
 }

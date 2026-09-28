@@ -3,7 +3,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@e
 import { Type } from "typebox";
 import { configPath, loadConfig } from "./config.js";
 import { createLabRecord, renderLabRecord, type LabSaveParams } from "./record.js";
-import { inspectRepository, publishRecord } from "./repository.js";
+import { inspectRepository, publishRecord, sanitizeRemoteForDisplay } from "./repository.js";
 import {
 	LABBOOK_ENTRY_TYPE,
 	LABBOOK_KINDS,
@@ -113,19 +113,46 @@ async function returnToAnchor(
 	ctx: ExtensionCommandContext,
 	state: LabbookActivityState,
 	label: string,
-): Promise<void> {
+): Promise<boolean> {
 	const leaf = ctx.sessionManager.getLeafEntry();
 	if (leaf) pi.setLabel(leaf.id, label);
 	const result = await ctx.navigateTree(state.start.anchorId, { summarize: false });
 	if (result.cancelled) {
 		ctx.ui.notify("Tree navigation was cancelled; the Lab branch remains active.", "warning");
-	} else {
-		ctx.ui.notify("Returned to the conversation point before /lab start. The Lab branch remains in /tree.", "info");
+		updateStatus(ctx);
+		return false;
 	}
+	ctx.ui.notify("Returned to the conversation point before /lab start. The Lab branch remains in /tree.", "info");
 	updateStatus(ctx);
+	return true;
 }
 
 export default function piLabbook(pi: ExtensionAPI): void {
+	const settledWaiters = new Set<(settled: boolean) => void>();
+
+	function waitForNextAgentSettled(timeoutMs = 180_000): Promise<boolean> {
+		return new Promise((resolvePromise) => {
+			let finished = false;
+			const finish = (settled: boolean) => {
+				if (finished) return;
+				finished = true;
+				clearTimeout(timer);
+				settledWaiters.delete(finish);
+				resolvePromise(settled);
+			};
+			const timer = setTimeout(() => finish(false), timeoutMs);
+			settledWaiters.add(finish);
+		});
+	}
+
+	function syncLabTool(ctx: ExtensionContext): void {
+		const active = Boolean(deriveActiveBranchState(ctx));
+		const tools = pi.getActiveTools();
+		const hasTool = tools.includes(TOOL_NAME);
+		if (active && !hasTool) pi.setActiveTools([...tools, TOOL_NAME]);
+		if (!active && hasTool) pi.setActiveTools(tools.filter((name) => name !== TOOL_NAME));
+	}
+
 	pi.registerTool({
 		name: TOOL_NAME,
 		label: "Save Labbook Record",
@@ -172,7 +199,7 @@ export default function piLabbook(pi: ExtensionAPI): void {
 					title: record.title,
 					labId: state.start.labId,
 					sessionId: state.start.sessionId,
-				});
+				}, signal);
 				if (result.status === "declined") {
 					appendEvent(pi, {
 						event: "save_declined",
@@ -268,9 +295,7 @@ export default function piLabbook(pi: ExtensionAPI): void {
 					workspace: ctx.cwd,
 					sessionId: ctx.sessionManager.getSessionId(),
 				});
-				if (!pi.getActiveTools().includes(TOOL_NAME)) {
-					pi.setActiveTools([...pi.getActiveTools(), TOOL_NAME]);
-				}
+				syncLabTool(ctx);
 				updateStatus(ctx);
 				pi.sendUserMessage(
 					`开始一段独立的 Lab 讨论。类型：${parsed.kind}。主题：${parsed.topic}。请先帮助我澄清目标和已知信息，一次只推进一个清晰问题；在我执行 /lab save 前不要写入或推送任何记录。`,
@@ -285,28 +310,39 @@ export default function piLabbook(pi: ExtensionAPI): void {
 					ctx.ui.notify("No active Lab discussion on this branch.", "warning");
 					return;
 				}
-				if (state.status === "save_requested") {
-					ctx.ui.notify("A Lab save is already pending.", "warning");
-					return;
-				}
 				if (state.status === "saved") {
 					ctx.ui.notify("This Lab discussion has already been saved.", "info");
 					return;
 				}
-				const requestId = randomUUID();
-				appendEvent(pi, {
-					event: "save_requested",
-					labId: state.start.labId,
-					requestId,
-					requestedAt: new Date().toISOString(),
-					...(remainder ? { guidance: remainder } : {}),
-				});
+				if (state.status === "save_requested") {
+					ctx.ui.notify("Retrying the pending Lab save request.", "info");
+				} else {
+					appendEvent(pi, {
+						event: "save_requested",
+						labId: state.start.labId,
+						requestId: randomUUID(),
+						requestedAt: new Date().toISOString(),
+						...(remainder ? { guidance: remainder } : {}),
+					});
+				}
+				const settled = waitForNextAgentSettled();
 				pi.sendUserMessage(
 					`请完成当前 Lab 记录并调用 ${TOOL_NAME}，且这一轮只调用该工具一次。忠实记录事实，不要补造信息。${remainder ? `额外要求：${remainder}` : ""}`,
 				);
-				await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
-				await ctx.waitForIdle();
-				const updated = deriveActiveBranchState(ctx);
+				const didSettle = await settled;
+				let updated = deriveActiveBranchState(ctx);
+				if (updated?.status === "save_requested" && updated.latest.event === "save_requested") {
+					appendEvent(pi, {
+						event: "save_failed",
+						labId: updated.start.labId,
+						requestId: updated.latest.requestId,
+						message: didSettle
+							? "The model did not call labbook_save"
+							: "The save turn did not settle before the extension timeout",
+						failedAt: new Date().toISOString(),
+					});
+					updated = deriveActiveBranchState(ctx);
+				}
 				if (updated?.status === "saved" && updated.latest.event === "saved") {
 					const saved = updated.latest as LabbookSavedEvent;
 					await returnToAnchor(pi, ctx, updated, `lab: ${updated.start.topic} (${saved.pushed ? "pushed" : "saved locally"})`);
@@ -340,7 +376,12 @@ export default function piLabbook(pi: ExtensionAPI): void {
 					cancelledAt: new Date().toISOString(),
 					...(remainder ? { reason: remainder } : {}),
 				});
-				await returnToAnchor(pi, ctx, state, `lab: ${state.start.topic} (cancelled)`);
+				const navigated = await returnToAnchor(pi, ctx, state, `lab: ${state.start.topic} (cancelled)`);
+				if (!navigated) {
+					pi.appendEntry(LABBOOK_ENTRY_TYPE, state.start);
+					syncLabTool(ctx);
+					updateStatus(ctx);
+				}
 				return;
 			}
 
@@ -362,7 +403,7 @@ export default function piLabbook(pi: ExtensionAPI): void {
 					const config = loadConfig();
 					const repo = await inspectRepository(pi, config);
 					ctx.ui.notify(
-						`Config: ${configPath()}\nRepository: ${repo.root}\nRemote: ${repo.remoteUrl}\nBranch: ${repo.branch}\nClean: ${repo.clean}`,
+						`Config: ${configPath()}\nRepository: ${repo.root}\nFetch remote: ${sanitizeRemoteForDisplay(repo.remoteUrl)}\nPush remote: ${repo.pushUrls.map(sanitizeRemoteForDisplay).join(", ")}\nBranch: ${repo.branch}\nClean: ${repo.clean}`,
 						"info",
 					);
 				} catch (error) {
@@ -388,7 +429,19 @@ export default function piLabbook(pi: ExtensionAPI): void {
 		};
 	});
 
-	pi.on("session_start", async (_event, ctx) => updateStatus(ctx));
-	pi.on("session_tree", async (_event, ctx) => updateStatus(ctx));
-	pi.on("session_shutdown", async (_event, ctx) => ctx.ui.setStatus(STATUS_KEY, undefined));
+	pi.on("agent_settled", async () => {
+		for (const resolveWaiter of [...settledWaiters]) resolveWaiter(true);
+	});
+	pi.on("session_start", async (_event, ctx) => {
+		syncLabTool(ctx);
+		updateStatus(ctx);
+	});
+	pi.on("session_tree", async (_event, ctx) => {
+		syncLabTool(ctx);
+		updateStatus(ctx);
+	});
+	pi.on("session_shutdown", async (_event, ctx) => {
+		for (const resolveWaiter of [...settledWaiters]) resolveWaiter(false);
+		ctx.ui.setStatus(STATUS_KEY, undefined);
+	});
 }

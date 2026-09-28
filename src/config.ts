@@ -73,13 +73,17 @@ export function loadConfig(path = configPath()): LabbookConfig {
 	if (publishMode !== "confirm" && publishMode !== "local-only") {
 		throw new Error("publishMode must be 'confirm' or 'local-only'");
 	}
+	const expectedRemote = typeof input.expectedRemote === "string" ? input.expectedRemote.trim() : "";
+	if (publishMode !== "local-only" && !expectedRemote) {
+		throw new Error("expectedRemote is required when publishMode is 'confirm'");
+	}
 	return {
 		version: 1,
 		repoPath: resolve(expandHome(repoValue.trim())),
 		recordsDir: safeRecordsDir(input.recordsDir ?? DEFAULT_CONFIG.recordsDir),
 		remote: safeName(input.remote ?? DEFAULT_CONFIG.remote, "remote"),
 		branch: safeName(input.branch ?? DEFAULT_CONFIG.branch, "branch"),
-		expectedRemote: typeof input.expectedRemote === "string" ? input.expectedRemote.trim() : "",
+		expectedRemote,
 		publishMode,
 		secretScan: input.secretScan !== false,
 	};

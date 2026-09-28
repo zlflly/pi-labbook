@@ -103,3 +103,38 @@ test("refuses to touch a dirty repository", async () => {
 	);
 	assert.equal(readFileSync(join(root, "dirty.txt"), "utf8"), "do not touch\n");
 });
+
+test("refuses a pushurl that differs from the confirmed remote", async () => {
+	const { root, config } = await fixture();
+	const other = join(root, "..", "other.git");
+	await execFileAsync("git", ["init", "--bare", other]);
+	await command(root, ["remote", "set-url", "--add", "--push", "origin", other]);
+	await assert.rejects(
+		publishRecord(pi, approvingContext, config, {
+			relativePath: "records/notes/2026/09/wrong-remote--abcdef12.md",
+			markdown: "# Wrong remote\n",
+			title: "Wrong remote",
+			labId: "abcdef12-abcd",
+			sessionId: "session-3",
+		}),
+		/Remote mismatch/,
+	);
+	assert.equal(await command(root, ["status", "--porcelain"]), "");
+});
+
+test("an already aborted publication makes no changes", async () => {
+	const { root, config } = await fixture();
+	const controller = new AbortController();
+	controller.abort();
+	await assert.rejects(
+		publishRecord(pi, approvingContext, config, {
+			relativePath: "records/notes/2026/09/aborted--abcdef12.md",
+			markdown: "# Aborted\n",
+			title: "Aborted",
+			labId: "abcdef12-abcd",
+			sessionId: "session-4",
+		}, controller.signal),
+		/aborted/,
+	);
+	assert.equal(await command(root, ["status", "--porcelain"]), "");
+});
