@@ -1,6 +1,6 @@
 {
   "name": "pi-labbook",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Branch-aware lab notes, memory, and experiment records for Pi with GitHub publishing",
   "type": "module",
   "license": "MIT",

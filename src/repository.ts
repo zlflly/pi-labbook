@@ -12,6 +12,12 @@ export interface PublishInput {
 	sessionId: string;
 }
 
+export interface PublishOptions {
+	signal?: AbortSignal;
+	/** The TUI already displayed the exact final Markdown and received explicit Yes/No confirmation. */
+	preconfirmed?: boolean;
+}
+
 export type PublishResult =
 	| { status: "declined" }
 	| { status: "saved"; relativePath: string; commit: string; pushed: boolean; pushError?: string };
@@ -84,7 +90,7 @@ function ensureNoSymlinkPath(root: string, destination: string): void {
 	}
 }
 
-function recordPathForConfig(config: LabbookConfig, generatedPath: string): string {
+export function recordPathForConfig(config: LabbookConfig, generatedPath: string): string {
 	const suffix = generatedPath.startsWith("records/") ? generatedPath.slice("records/".length) : generatedPath;
 	return `${config.recordsDir.replace(/\/$/, "")}/${suffix}`;
 }
@@ -141,13 +147,25 @@ function assertExpectedRemote(
 	}
 }
 
+export function validateRepositoryForPublish(
+	config: LabbookConfig,
+	repository: { root: string; remoteUrl: string; pushUrls: string[]; branch: string; clean: boolean },
+): void {
+	if (!repository.clean) throw new Error(`Labbook repository has uncommitted changes: ${repository.root}`);
+	if (repository.branch !== config.branch) {
+		throw new Error(`Labbook repository is on branch '${repository.branch}', expected '${config.branch}'`);
+	}
+	assertExpectedRemote(config, repository);
+}
+
 async function publishRecordUnlocked(
 	pi: Pick<ExtensionAPI, "exec">,
 	ctx: ExtensionContext,
 	config: LabbookConfig,
 	input: PublishInput,
-	signal?: AbortSignal,
+	options: PublishOptions,
 ): Promise<PublishResult> {
+	const signal = options.signal;
 	if (!ctx.hasUI && config.publishMode === "confirm") {
 		throw new Error("Publishing requires an interactive confirmation UI");
 	}
@@ -161,20 +179,13 @@ async function publishRecordUnlocked(
 
 	throwIfAborted(signal);
 	const initial = await inspectRepository(pi, config, signal);
-	if (!initial.clean) throw new Error(`Labbook repository has uncommitted changes: ${initial.root}`);
-	if (initial.branch !== config.branch) {
-		throw new Error(`Labbook repository is on branch '${initial.branch}', expected '${config.branch}'`);
-	}
-	assertExpectedRemote(config, initial);
+	validateRepositoryForPublish(config, initial);
 
 	const lock = acquireLock(initial.root);
 	try {
 		await runGit(pi, initial.root, ["pull", "--ff-only", config.remote, config.branch], 120_000, signal);
 		const afterPull = await inspectRepository(pi, config, signal);
-		if (!afterPull.clean || afterPull.branch !== config.branch) {
-			throw new Error("Repository changed during synchronization; refusing to publish");
-		}
-		assertExpectedRemote(config, afterPull);
+		validateRepositoryForPublish(config, afterPull);
 		throwIfAborted(signal);
 
 		const relativePath = recordPathForConfig(config, input.relativePath);
@@ -186,7 +197,7 @@ async function publishRecordUnlocked(
 		resolveContainedPath(initial.root, relative(initial.root, parentReal));
 		if (existsSync(destination)) throw new Error(`Record already exists: ${relativePath}`);
 
-		if (config.publishMode === "confirm") {
+		if (config.publishMode === "confirm" && !options.preconfirmed) {
 			const previewLimit = 7_000;
 			const preview = input.markdown.length > previewLimit
 				? `${input.markdown.slice(0, previewLimit)}\n\n[preview truncated]`
@@ -262,7 +273,7 @@ export async function publishRecord(
 	ctx: ExtensionContext,
 	config: LabbookConfig,
 	input: PublishInput,
-	signal?: AbortSignal,
+	options: PublishOptions = {},
 ): Promise<PublishResult> {
-	return withFileMutationQueue(config.repoPath, () => publishRecordUnlocked(pi, ctx, config, input, signal));
+	return withFileMutationQueue(config.repoPath, () => publishRecordUnlocked(pi, ctx, config, input, options));
 }

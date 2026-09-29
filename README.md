@@ -9,7 +9,9 @@
 - 三种记录类型：`experiment`、`note`、`memory`
 - 使用 Pi 原生 Tree 保存完整讨论分支
 - 分支状态随 Session 保存，支持恢复和手动 Tree 导航
-- 保存前展示目标仓库、分支、文件路径和 Markdown 预览
+- `/lab save` 时流式显示将要保存的 Markdown 原文
+- 预览支持滚动，生成完成后在同一界面显示 Yes/No 确认
+- 保存前展示实际目标仓库、Push URL、分支和文件路径
 - 只 stage 扩展生成的单个文件
 - 仓库不干净、分支错误、远端不匹配时拒绝写入
 - `git pull --ff-only` 和普通 fast-forward push，绝不 force-push
@@ -124,14 +126,14 @@ Pi 会进入 Lab 模式，与你澄清目标、事实、观察、决策和结论
 
 保存流程：
 
-1. 当前模型把 Lab 分支整理为结构化记录；
-2. 扩展执行敏感信息扫描；
-3. 验证仓库、分支、远端和工作区清洁状态；
-4. `git pull --ff-only`；
-5. 显示记录预览并要求确认；
-6. 原子写入一个 Markdown 文件；
-7. 只 stage 该文件并 commit；
-8. push 到配置的 GitHub 分支；
+1. 扩展验证实际仓库、Push URL、分支和工作区状态；
+2. 当前模型开始整理 Lab 分支，Markdown 内容实时流式显示；
+3. 生成结束后切换为完整、精确的最终 Markdown 原文；
+4. 使用 `↑`/`↓`、`PageUp`/`PageDown` 检查内容；
+5. 在同一界面按 `Y`/`Enter` 确认，或按 `N`/`Esc` 取消；
+6. 扩展再次验证仓库并执行敏感信息扫描；
+7. `git pull --ff-only`，随后原子写入 Markdown；
+8. 只 stage 该文件，commit 并 push；
 9. 回到 `/lab start` 前的 Tree 锚点。
 
 如果拒绝发布或保存失败，会留在 Lab 分支，以便修改和重试。
@@ -190,7 +192,7 @@ pi update --extensions
 如需固定版本：
 
 ```bash
-pi install git:github.com/zlflly/pi-labbook@v0.1.2
+pi install git:github.com/zlflly/pi-labbook@v0.2.0
 ```
 
 ### 3. Clone 私人记录仓库

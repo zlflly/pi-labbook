@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { UserMessage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { matchesKey, ScrollView, stripTerminalSequences, Text, VStack } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { configPath, loadConfig } from "./config.js";
 import { createLabRecord, renderLabRecord, type LabSaveParams } from "./record.js";
-import { inspectRepository, publishRecord, sanitizeRemoteForDisplay } from "./repository.js";
+import { inspectRepository, publishRecord, recordPathForConfig, sanitizeRemoteForDisplay, validateRepositoryForPublish } from "./repository.js";
 import {
 	LABBOOK_ENTRY_TYPE,
 	LABBOOK_KINDS,
@@ -22,76 +23,42 @@ const STATUS_KEY = "pi-labbook";
 const LEGACY_TOOL_NAME = "labbook_save";
 const MAX_CONVERSATION_CHARS = 60_000;
 
-const SaveSchema = Type.Object(
+const MetadataSchema = Type.Object(
 	{
 		title: Type.String({ minLength: 1, maxLength: 200 }),
 		summary: Type.String({ minLength: 1, maxLength: 1000 }),
-		objective: Type.Optional(Type.String({ maxLength: 8000 })),
-		hypothesis: Type.Optional(Type.String({ maxLength: 8000 })),
-		method: Type.Array(Type.String({ minLength: 1, maxLength: 4000 }), { maxItems: 100 }),
-		observations: Type.Array(Type.String({ minLength: 1, maxLength: 8000 }), { maxItems: 200 }),
-		decisions: Type.Array(Type.String({ minLength: 1, maxLength: 4000 }), { maxItems: 100 }),
-		conclusion: Type.String({ minLength: 1, maxLength: 12000 }),
-		nextSteps: Type.Array(Type.String({ minLength: 1, maxLength: 4000 }), { maxItems: 100 }),
-		artifacts: Type.Array(Type.String({ minLength: 1, maxLength: 2000 }), { maxItems: 100 }),
 		tags: Type.Array(Type.String({ minLength: 1, maxLength: 48 }), { maxItems: 32 }),
 	},
 	{ additionalProperties: false },
 );
 
-type SaveParams = {
+type PreparedMetadata = {
 	title: string;
 	summary: string;
-	objective?: string;
-	hypothesis?: string;
-	method: string[];
-	observations: string[];
-	decisions: string[];
-	conclusion: string;
-	nextSteps: string[];
-	artifacts: string[];
 	tags: string[];
 };
 
-const EXTRACTION_PROMPT = `You turn one Pi Lab discussion into a faithful structured record.
+type PreparedDraft = PreparedMetadata & {
+	body: string;
+};
+
+const EXTRACTION_PROMPT = `You turn one Pi Lab discussion into a faithful Markdown record.
 Use only facts present in the conversation. Never invent methods, observations, decisions, conclusions, artifacts, or next steps.
 Keep observations separate from decisions and conclusions.
 Write in the user's language. Preserve exact commands, paths, model names, hosts, ports, errors, and identifiers.
-Return exactly one <labbook_record> tag containing valid JSON and no other text.
-The JSON object must have exactly these fields:
-- title: string
-- summary: string
-- objective?: string
-- hypothesis?: string
-- method: string[]
-- observations: string[]
-- decisions: string[]
-- conclusion: string
-- nextSteps: string[]
-- artifacts: string[]
-- tags: string[]
-Use empty arrays for categories not established by the conversation.`;
 
-function bullets(items: readonly string[]): string {
-	return items.length > 0 ? items.map((item) => `- ${item}`).join("\n") : "- None recorded";
-}
+Output exactly these two blocks and no other text:
+<labbook_preview>
+The complete Markdown body without YAML frontmatter and without an H1 title.
+</labbook_preview>
+<labbook_metadata>{"title":"...","summary":"...","tags":["..."]}</labbook_metadata>
 
-function recordBody(params: SaveParams): string {
-	const sections = [
-		`## Summary\n\n${params.summary}`,
-		`## Objective\n\n${params.objective?.trim() || "Not specified"}`,
-	];
-	if (params.hypothesis?.trim()) sections.push(`## Hypothesis\n\n${params.hypothesis.trim()}`);
-	sections.push(
-		`## Method\n\n${bullets(params.method)}`,
-		`## Observations\n\n${bullets(params.observations)}`,
-		`## Decisions\n\n${bullets(params.decisions)}`,
-		`## Conclusion\n\n${params.conclusion}`,
-		`## Next steps\n\n${bullets(params.nextSteps)}`,
-		`## Artifacts\n\n${bullets(params.artifacts)}`,
-	);
-	return sections.join("\n\n");
-}
+The preview is the exact body the user will review and save. Do not mention these formatting instructions in it.
+Choose headings for the record type:
+- experiment: Summary, Objective, Hypothesis (only if actually discussed), Environment, Method, Observations, Decisions, Conclusion, Next steps, Artifacts.
+- note: Summary, Context, Key points, Details, Decisions, Open questions, References.
+- memory: Statement, When to apply, Evidence, Exceptions, Source, Last verified.
+Omit optional sections with no established information instead of inventing placeholders.`;
 
 function messageText(content: unknown): string {
 	if (typeof content === "string") return content;
@@ -122,54 +89,239 @@ export function buildLabConversation(branch: readonly SessionEntry[], labId: str
 	return `[Earlier Lab discussion omitted]\n${conversation.slice(-MAX_CONVERSATION_CHARS)}`;
 }
 
-export function parsePreparedRecord(text: string): SaveParams {
-	const match = /<labbook_record>([\s\S]*?)<\/labbook_record>/i.exec(text);
-	if (!match) throw new Error("The preparation model did not return <labbook_record> JSON");
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(match[1].trim());
-	} catch (error) {
-		throw new Error(`The preparation model returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
-	}
-	if (!Value.Check(SaveSchema, parsed)) {
-		throw new Error("The preparation model returned a record that does not match the required schema");
-	}
-	return parsed as SaveParams;
+export function sanitizeGeneratedText(text: string): string {
+	return stripTerminalSequences(text)
+		.replace(/\u009D[\s\S]*?(?:\u009C|\u0007)/g, "")
+		.replace(/\u009B[0-?]*[ -/]*[@-~]/g, "")
+		.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "");
 }
 
+export function extractStreamingPreview(text: string): string {
+	const startMarker = "<labbook_preview>";
+	const endMarker = "</labbook_preview>";
+	const start = text.indexOf(startMarker);
+	if (start < 0) return "";
+	const contentStart = start + startMarker.length;
+	const end = text.indexOf(endMarker, contentStart);
+	return text.slice(contentStart, end < 0 ? undefined : end).replace(/^\s+/, "");
+}
+
+export function parsePreparedRecord(text: string): PreparedDraft {
+	const body = sanitizeGeneratedText(extractStreamingPreview(text)).trim();
+	if (!body || !text.includes("</labbook_preview>")) {
+		throw new Error("The preparation model did not return a complete <labbook_preview>");
+	}
+	const metadataMatch = /<labbook_metadata>([\s\S]*?)<\/labbook_metadata>/i.exec(text);
+	if (!metadataMatch) throw new Error("The preparation model did not return <labbook_metadata> JSON");
+	let metadata: unknown;
+	try {
+		metadata = JSON.parse(metadataMatch[1].trim());
+	} catch (error) {
+		throw new Error(`The preparation model returned invalid metadata JSON: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!Value.Check(MetadataSchema, metadata)) {
+		throw new Error("The preparation model returned metadata that does not match the required schema");
+	}
+	return { ...(metadata as PreparedMetadata), body };
+}
+
+function createRecordFromDraft(state: LabbookActivityState, draft: PreparedDraft, endedAt: string) {
+	const input: LabSaveParams = {
+		labId: state.start.labId,
+		kind: state.start.kind,
+		title: draft.title,
+		startedAt: state.start.startedAt,
+		endedAt,
+		summary: draft.summary,
+		tags: draft.tags,
+		body: draft.body,
+		metadata: {
+			workspace: state.start.workspace,
+			pi_session: state.start.sessionId,
+			pi_anchor: state.start.anchorId,
+		},
+	};
+	return createLabRecord(input);
+}
+
+type PreparedResult = {
+	record: ReturnType<typeof createLabRecord>;
+	preconfirmed: boolean;
+};
+
+type StreamingUiResult =
+	| { kind: "confirmed"; record: ReturnType<typeof createLabRecord> }
+	| { kind: "declined" }
+	| { kind: "error"; message: string };
+
 async function prepareRecord(
+	pi: ExtensionAPI,
 	ctx: ExtensionCommandContext,
 	state: LabbookActivityState,
 	guidance: string,
-): Promise<SaveParams> {
+	config: ReturnType<typeof loadConfig>,
+): Promise<PreparedResult | undefined> {
 	if (!ctx.model) throw new Error("No model is selected for preparing the Lab record");
+	const model = ctx.model;
 	const conversation = buildLabConversation(ctx.sessionManager.getBranch(), state.start.labId);
 	if (!conversation.trim()) throw new Error("The active Lab branch has no discussion to save");
-	ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", "lab:preparing"));
-	try {
-		const message: UserMessage = {
-			role: "user",
-			content: [{
-				type: "text",
-				text: `Lab type: ${state.start.kind}\nLab topic: ${state.start.topic}\n${guidance ? `Additional guidance: ${guidance}\n` : ""}\nConversation:\n${conversation}`,
-			}],
-			timestamp: Date.now(),
-		};
-		const response = await ctx.modelRegistry.complete(
-			ctx.model,
-			{ systemPrompt: EXTRACTION_PROMPT, messages: [message] },
-			{},
-		);
+	const message: UserMessage = {
+		role: "user",
+		content: [{
+			type: "text",
+			text: `Lab type: ${state.start.kind}\nLab topic: ${state.start.topic}\n${guidance ? `Additional guidance: ${guidance}\n` : ""}\nConversation:\n${conversation}`,
+		}],
+		timestamp: Date.now(),
+	};
+
+	if (ctx.mode !== "tui") {
+		const response = await ctx.modelRegistry.complete(model, { systemPrompt: EXTRACTION_PROMPT, messages: [message] }, {});
 		if (response.stopReason === "error") throw new Error(response.errorMessage || "Record preparation failed");
 		if (response.stopReason === "aborted") throw new Error("Record preparation was aborted");
+		if (response.stopReason !== "stop") throw new Error(`Record preparation stopped with reason: ${response.stopReason}`);
 		const text = response.content
 			.filter((part): part is { type: "text"; text: string } => part.type === "text")
 			.map((part) => part.text)
 			.join("\n");
-		return parsePreparedRecord(text);
-	} finally {
-		updateStatus(ctx);
+		return { record: createRecordFromDraft(state, parsePreparedRecord(text), new Date().toISOString()), preconfirmed: false };
 	}
+
+	const repository = await inspectRepository(pi, config);
+	validateRepositoryForPublish(config, repository);
+	const result = await ctx.ui.custom<StreamingUiResult>((tui, theme, _keybindings, done) => {
+		const controller = new AbortController();
+		const source = new Text("Waiting for the record preview…", 1, 1);
+		const header = new Text(theme.fg("accent", theme.bold("Labbook record preview (exact Markdown source)")), 1, 0);
+		const target = new Text(
+			`Repository: ${repository.root}\nPush remote: ${repository.pushUrls.map(sanitizeRemoteForDisplay).join(", ")}\nBranch: ${repository.branch}\nFile: preparing…`,
+			1,
+			0,
+		);
+		const footer = new Text(theme.fg("dim", "Streaming preview…  Esc cancels  ↑↓/PgUp/PgDn scroll"), 1, 0);
+		const scroll = new ScrollView(source, {
+			follow: "end",
+			primary: true,
+			overscroll: "contain",
+			scrollbar: "auto",
+			scrollbarTrackStyle: (text) => theme.fg("dim", text),
+			scrollbarThumbStyle: (text) => theme.fg("accent", text),
+		});
+		const container = new VStack([
+			{ component: header, basis: "auto", shrink: 0 },
+			{ component: target, basis: "auto", shrink: 0 },
+			{ component: scroll, grow: 1, minSize: 6 },
+			{ component: footer, basis: "auto", shrink: 0 },
+		]) as VStack & { handleInput(data: string): void };
+
+		let phase: "streaming" | "confirm" | "error" = "streaming";
+		let raw = "";
+		let preparedRecord: ReturnType<typeof createLabRecord> | undefined;
+		let errorMessage = "";
+		let disposed = false;
+		let sawSuccessfulDone = false;
+		const textBlocks = new Map<number, string>();
+
+		const combinedText = () => [...textBlocks.entries()]
+			.sort(([left], [right]) => left - right)
+			.map(([, text]) => text)
+			.join("\n");
+		const refresh = () => {
+			if (!disposed) tui.requestRender();
+		};
+
+		void (async () => {
+			try {
+				const stream = ctx.modelRegistry.streamSimple(
+					model,
+					{ systemPrompt: EXTRACTION_PROMPT, messages: [message] },
+					{ signal: controller.signal },
+				);
+				for await (const event of stream) {
+					if (event.type === "text_delta") {
+						textBlocks.set(event.contentIndex, `${textBlocks.get(event.contentIndex) ?? ""}${event.delta}`);
+						raw = combinedText();
+						const preview = sanitizeGeneratedText(extractStreamingPreview(raw));
+						if (preview) source.setText(preview);
+						refresh();
+					} else if (event.type === "text_end") {
+						textBlocks.set(event.contentIndex, event.content);
+						raw = combinedText();
+					} else if (event.type === "done") {
+						if (event.reason !== "stop") throw new Error(`Record preparation stopped with reason: ${event.reason}`);
+						raw = event.message.content
+							.filter((part): part is { type: "text"; text: string } => part.type === "text")
+							.map((part) => part.text)
+							.join("\n");
+						sawSuccessfulDone = true;
+					} else if (event.type === "error") {
+						throw new Error(event.error.errorMessage || "Record preparation failed");
+					}
+				}
+				if (!sawSuccessfulDone) throw new Error("Record preparation stream ended without a successful completion");
+				const draft = parsePreparedRecord(raw);
+				preparedRecord = createRecordFromDraft(state, draft, new Date().toISOString());
+				source.setText(renderLabRecord(preparedRecord));
+				target.setText(
+					`Repository: ${repository.root}\nPush remote: ${repository.pushUrls.map(sanitizeRemoteForDisplay).join(", ")}\nBranch: ${repository.branch}\nFile: ${recordPathForConfig(config, preparedRecord.relativePath)}`,
+				);
+				footer.setText(theme.fg("dim", config.publishMode === "local-only"
+					? "Create this exact local commit?  [Y/Enter] Yes  [N/Esc] No  ↑↓/PgUp/PgDn scroll"
+					: "Save, commit and push this exact record?  [Y/Enter] Yes  [N/Esc] No  ↑↓/PgUp/PgDn scroll"));
+				phase = "confirm";
+				scroll.scrollToStart();
+				refresh();
+			} catch (error) {
+				if (disposed) return;
+				errorMessage = error instanceof Error ? error.message : String(error);
+				phase = "error";
+				source.setText(`Preparation failed: ${errorMessage}`);
+				footer.setText(theme.fg("warning", "Press Enter or Esc to close"));
+				scroll.scrollToStart();
+				refresh();
+			}
+		})();
+
+		container.handleInput = (data: string) => {
+			if (matchesKey(data, "up")) scroll.scrollBy(-1);
+			else if (matchesKey(data, "down")) scroll.scrollBy(1);
+			else if (matchesKey(data, "pageUp")) scroll.scrollBy(-Math.max(1, scroll.viewportHeight - 1));
+			else if (matchesKey(data, "pageDown")) scroll.scrollBy(Math.max(1, scroll.viewportHeight - 1));
+			else if (matchesKey(data, "home")) scroll.scrollToStart();
+			else if (matchesKey(data, "end")) scroll.scrollToEnd();
+			else if (phase === "streaming" && matchesKey(data, "escape")) {
+				disposed = true;
+				controller.abort();
+				done({ kind: "declined" });
+				return;
+			} else if (phase === "confirm" && (matchesKey(data, "enter") || matchesKey(data, "y") || matchesKey(data, "shift+y"))) {
+				disposed = true;
+				done({ kind: "confirmed", record: preparedRecord! });
+				return;
+			} else if (phase === "confirm" && (matchesKey(data, "escape") || matchesKey(data, "n") || matchesKey(data, "shift+n"))) {
+				disposed = true;
+				done({ kind: "declined" });
+				return;
+			} else if (phase === "error" && (matchesKey(data, "enter") || matchesKey(data, "escape"))) {
+				disposed = true;
+				done({ kind: "error", message: errorMessage });
+				return;
+			}
+			refresh();
+		};
+		return container;
+	}, {
+		overlay: true,
+		overlayOptions: {
+			width: "90%",
+			maxHeight: "90%",
+			anchor: "center",
+			margin: 1,
+		},
+	});
+
+	if (result.kind === "declined") return undefined;
+	if (result.kind === "error") throw new Error(result.message);
+	return { record: result.record, preconfirmed: true };
 }
 
 function updateStatus(ctx: ExtensionContext): void {
@@ -317,32 +469,26 @@ export default function piLabbook(pi: ExtensionAPI): void {
 				}
 
 				try {
-					const prepared = await prepareRecord(ctx, state, remainder || request.guidance || "");
-					const endedAt = new Date().toISOString();
-					const input: LabSaveParams = {
-						labId: state.start.labId,
-						kind: state.start.kind,
-						title: prepared.title,
-						startedAt: state.start.startedAt,
-						endedAt,
-						summary: prepared.summary,
-						tags: prepared.tags,
-						body: recordBody(prepared),
-						metadata: {
-							workspace: state.start.workspace,
-							pi_session: state.start.sessionId,
-							pi_anchor: state.start.anchorId,
-						},
-					};
 					const config = loadConfig();
-					const record = createLabRecord(input);
+					const prepared = await prepareRecord(pi, ctx, state, remainder || request.guidance || "", config);
+					if (!prepared) {
+						appendEvent(pi, {
+							event: "save_declined",
+							labId: state.start.labId,
+							requestId: request.requestId,
+							declinedAt: new Date().toISOString(),
+						});
+						ctx.ui.notify("Publication was declined; staying in the Lab branch.", "info");
+						return;
+					}
+					const record = prepared.record;
 					const result = await publishRecord(pi, ctx, config, {
 						relativePath: record.relativePath,
 						markdown: renderLabRecord(record),
 						title: record.title,
 						labId: state.start.labId,
 						sessionId: state.start.sessionId,
-					});
+					}, { preconfirmed: prepared.preconfirmed });
 					if (result.status === "declined") {
 						appendEvent(pi, {
 							event: "save_declined",
@@ -361,7 +507,7 @@ export default function piLabbook(pi: ExtensionAPI): void {
 						relativePath: result.relativePath,
 						commit: result.commit,
 						pushed: result.pushed,
-						savedAt: endedAt,
+						savedAt: new Date().toISOString(),
 					};
 					pi.appendEntry(LABBOOK_ENTRY_TYPE, saved);
 					const fresh = deriveActiveBranchState(ctx);

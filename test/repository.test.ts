@@ -133,7 +133,7 @@ test("an already aborted publication makes no changes", async () => {
 			title: "Aborted",
 			labId: "abcdef12-abcd",
 			sessionId: "session-4",
-		}, controller.signal),
+		}, { signal: controller.signal }),
 		/aborted/,
 	);
 	assert.equal(await command(root, ["status", "--porcelain"]), "");

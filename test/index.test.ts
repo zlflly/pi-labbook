@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { buildLabConversation, parsePreparedRecord } from "../src/index.js";
+import { buildLabConversation, extractStreamingPreview, parsePreparedRecord, sanitizeGeneratedText } from "../src/index.js";
 
 function custom(data: unknown): SessionEntry {
 	return {
@@ -46,19 +46,27 @@ test("buildLabConversation includes only dialogue after the selected Lab start",
 	assert.equal(conversation, "User: observation\n\nAssistant: follow-up");
 });
 
-test("parsePreparedRecord accepts exact tagged JSON and rejects malformed output", () => {
-	const payload = {
-		title: "测试",
-		summary: "摘要",
-		method: [],
-		observations: ["观察"],
-		decisions: [],
-		conclusion: "结论",
-		nextSteps: [],
-		artifacts: [],
-		tags: ["test"],
-	};
-	assert.deepEqual(parsePreparedRecord(`<labbook_record>${JSON.stringify(payload)}</labbook_record>`), payload);
-	assert.throws(() => parsePreparedRecord(JSON.stringify(payload)), /did not return/);
-	assert.throws(() => parsePreparedRecord("<labbook_record>{bad}</labbook_record>"), /invalid JSON/);
+test("streaming preview grows before metadata is complete", () => {
+	assert.equal(extractStreamingPreview("<labbook_pre"), "");
+	assert.equal(extractStreamingPreview("<labbook_preview>\n## Summary\n\n测"), "## Summary\n\n测");
+	assert.equal(
+		extractStreamingPreview("<labbook_preview>\n## Summary\n\n测试\n</labbook_preview><labbook_metadata>"),
+		"## Summary\n\n测试\n",
+	);
+});
+
+test("streamed preview strips terminal control sequences before display or save", () => {
+	const hostile = "safe\u001b]52;c;Y2xpcGJvYXJk\u0007 text\u0007 \u001b[31mred\u001b[0m\u009b31m";
+	assert.equal(sanitizeGeneratedText(hostile), "safe text red");
+});
+
+test("parsePreparedRecord accepts preview plus metadata and rejects malformed output", () => {
+	const metadata = { title: "测试", summary: "摘要", tags: ["test"] };
+	const output = `<labbook_preview>\n## Summary\n\n测试内容\n</labbook_preview>\n<labbook_metadata>${JSON.stringify(metadata)}</labbook_metadata>`;
+	assert.deepEqual(parsePreparedRecord(output), { ...metadata, body: "## Summary\n\n测试内容" });
+	assert.throws(() => parsePreparedRecord(JSON.stringify(metadata)), /complete <labbook_preview>/);
+	assert.throws(
+		() => parsePreparedRecord("<labbook_preview>body</labbook_preview><labbook_metadata>{bad}</labbook_metadata>"),
+		/invalid metadata JSON/,
+	);
 });
