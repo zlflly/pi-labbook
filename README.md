@@ -190,7 +190,7 @@ pi update --extensions
 如需固定版本：
 
 ```bash
-pi install git:github.com/zlflly/pi-labbook@v0.1.1
+pi install git:github.com/zlflly/pi-labbook@v0.1.2
 ```
 
 ### 3. Clone 私人记录仓库

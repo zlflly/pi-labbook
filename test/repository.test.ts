@@ -72,7 +72,7 @@ const approvingContext = {
 
 test("publishes exactly one generated record and pushes it", async () => {
 	const { root, remote, config } = await fixture();
-	const relativePath = "records/experiments/2026/09/vpn-test--12345678.md";
+	const relativePath = "records/experiments/2026/09/测试-vpn--12345678.md";
 	const result = await publishRecord(pi, approvingContext, config, {
 		relativePath,
 		markdown: "---\ntitle: \"VPN test\"\n---\n\n# VPN test\n\nWorked.\n",

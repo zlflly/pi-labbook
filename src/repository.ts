@@ -57,7 +57,7 @@ async function runGit(
 	timeout = 60_000,
 	signal?: AbortSignal,
 ): Promise<string> {
-	const result = await pi.exec("git", ["-c", "credential.interactive=false", ...args], {
+	const result = await pi.exec("git", ["-c", "credential.interactive=false", "-c", "core.quotePath=false", ...args], {
 		cwd,
 		timeout,
 		signal,
@@ -207,7 +207,7 @@ async function publishRecordUnlocked(
 			throwIfAborted(signal);
 			renameSync(temp, destination);
 			await runGit(pi, initial.root, ["add", "--", relativePath], 60_000, signal);
-			const staged = (await runGit(pi, initial.root, ["diff", "--cached", "--name-only", "--"], 60_000, signal)).split("\n").filter(Boolean);
+			const staged = (await runGit(pi, initial.root, ["diff", "--cached", "--name-only", "-z", "--"], 60_000, signal)).split("\0").filter(Boolean);
 			if (staged.length !== 1 || staged[0] !== relativePath) {
 				throw new Error(`Unexpected staged paths: ${staged.join(", ") || "none"}`);
 			}
