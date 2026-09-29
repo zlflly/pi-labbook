@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { buildLabConversation, extractStreamingPreview, parsePreparedRecord, sanitizeGeneratedText } from "../src/index.js";
+import {
+	buildLabConversation,
+	findAssistantRecordAfterRequest,
+	parseVisibleRecord,
+	sanitizeGeneratedText,
+} from "../src/index.js";
+import { deriveStateFromEntries } from "../src/state.js";
 
 function custom(data: unknown): SessionEntry {
 	return {
@@ -14,7 +20,7 @@ function custom(data: unknown): SessionEntry {
 	} as SessionEntry;
 }
 
-function message(role: "user" | "assistant", text: string): SessionEntry {
+function message(role: "user" | "assistant", text: string, stopReason = "stop"): SessionEntry {
 	return {
 		type: "message",
 		id: crypto.randomUUID(),
@@ -29,14 +35,33 @@ function message(role: "user" | "assistant", text: string): SessionEntry {
 				provider: "test",
 				model: "test",
 				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-				stopReason: "stop",
+				stopReason,
 				timestamp: Date.now(),
 			},
 	} as SessionEntry;
 }
 
+const start = {
+	version: 1,
+	event: "start",
+	labId: "lab-1",
+	anchorId: "a",
+	kind: "note",
+	topic: "测试主题",
+	startedAt: new Date().toISOString(),
+	workspace: "/w",
+	sessionId: "s",
+};
+
+const request = {
+	version: 1,
+	event: "save_requested",
+	labId: "lab-1",
+	requestId: "request-1",
+	requestedAt: new Date().toISOString(),
+};
+
 test("buildLabConversation includes only dialogue after the selected Lab start", () => {
-	const start = { version: 1, event: "start", labId: "lab-1", anchorId: "a", kind: "note", topic: "t", startedAt: new Date().toISOString(), workspace: "/w", sessionId: "s" };
 	const conversation = buildLabConversation([
 		message("user", "before"),
 		custom(start),
@@ -46,27 +71,30 @@ test("buildLabConversation includes only dialogue after the selected Lab start",
 	assert.equal(conversation, "User: observation\n\nAssistant: follow-up");
 });
 
-test("streaming preview grows before metadata is complete", () => {
-	assert.equal(extractStreamingPreview("<labbook_pre"), "");
-	assert.equal(extractStreamingPreview("<labbook_preview>\n## Summary\n\n测"), "## Summary\n\n测");
-	assert.equal(
-		extractStreamingPreview("<labbook_preview>\n## Summary\n\n测试\n</labbook_preview><labbook_metadata>"),
-		"## Summary\n\n测试\n",
-	);
-});
-
-test("streamed preview strips terminal control sequences before display or save", () => {
+test("generated Markdown strips terminal control sequences before save", () => {
 	const hostile = "safe\u001b]52;c;Y2xpcGJvYXJk\u0007 text\u0007 \u001b[31mred\u001b[0m\u009b31m";
 	assert.equal(sanitizeGeneratedText(hostile), "safe text red");
 });
 
-test("parsePreparedRecord accepts preview plus metadata and rejects malformed output", () => {
-	const metadata = { title: "测试", summary: "摘要", tags: ["test"] };
-	const output = `<labbook_preview>\n## Summary\n\n测试内容\n</labbook_preview>\n<labbook_metadata>${JSON.stringify(metadata)}</labbook_metadata>`;
-	assert.deepEqual(parsePreparedRecord(output), { ...metadata, body: "## Summary\n\n测试内容" });
-	assert.throws(() => parsePreparedRecord(JSON.stringify(metadata)), /complete <labbook_preview>/);
-	assert.throws(
-		() => parsePreparedRecord("<labbook_preview>body</labbook_preview><labbook_metadata>{bad}</labbook_metadata>"),
-		/invalid metadata JSON/,
-	);
+test("parseVisibleRecord uses the streamed H1 and summary section", () => {
+	const state = deriveStateFromEntries([custom(start), custom(request)]);
+	assert.ok(state);
+	const draft = parseVisibleRecord("# 测试记录\n\n## Summary\n\n这是摘要。\n\n## Details\n\n正文。", state);
+	assert.deepEqual(draft, {
+		title: "测试记录",
+		summary: "这是摘要。",
+		body: "## Summary\n\n这是摘要。\n\n## Details\n\n正文。",
+		tags: ["note"],
+	});
+});
+
+test("findAssistantRecordAfterRequest ignores earlier and incomplete assistant messages", () => {
+	const branch = [
+		custom(start),
+		message("assistant", "earlier"),
+		custom(request),
+		message("assistant", "# incomplete", "length"),
+		message("assistant", "# Final\n\n## Summary\n\nDone"),
+	];
+	assert.equal(findAssistantRecordAfterRequest(branch, "request-1"), "# Final\n\n## Summary\n\nDone");
 });
