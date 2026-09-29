@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { UserMessage } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { Value } from "typebox/value";
 import { configPath, loadConfig } from "./config.js";
 import { createLabRecord, renderLabRecord, type LabSaveParams } from "./record.js";
 import { inspectRepository, publishRecord, sanitizeRemoteForDisplay } from "./repository.js";
@@ -9,6 +11,7 @@ import {
 	LABBOOK_KINDS,
 	LABBOOK_STATE_VERSION,
 	deriveActiveBranchState,
+	parseLabbookEntry,
 	type LabbookActivityState,
 	type LabbookKind,
 	type LabbookSavedEvent,
@@ -16,12 +19,13 @@ import {
 } from "./state.js";
 
 const STATUS_KEY = "pi-labbook";
-const TOOL_NAME = "labbook_save";
+const LEGACY_TOOL_NAME = "labbook_save";
+const MAX_CONVERSATION_CHARS = 60_000;
 
 const SaveSchema = Type.Object(
 	{
-		title: Type.String({ minLength: 1, maxLength: 200, description: "Specific title in the user's language" }),
-		summary: Type.String({ minLength: 1, maxLength: 1000, description: "Concise summary" }),
+		title: Type.String({ minLength: 1, maxLength: 200 }),
+		summary: Type.String({ minLength: 1, maxLength: 1000 }),
 		objective: Type.Optional(Type.String({ maxLength: 8000 })),
 		hypothesis: Type.Optional(Type.String({ maxLength: 8000 })),
 		method: Type.Array(Type.String({ minLength: 1, maxLength: 4000 }), { maxItems: 100 }),
@@ -35,7 +39,7 @@ const SaveSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
-type SaveToolParams = {
+type SaveParams = {
 	title: string;
 	summary: string;
 	objective?: string;
@@ -49,11 +53,30 @@ type SaveToolParams = {
 	tags: string[];
 };
 
+const EXTRACTION_PROMPT = `You turn one Pi Lab discussion into a faithful structured record.
+Use only facts present in the conversation. Never invent methods, observations, decisions, conclusions, artifacts, or next steps.
+Keep observations separate from decisions and conclusions.
+Write in the user's language. Preserve exact commands, paths, model names, hosts, ports, errors, and identifiers.
+Return exactly one <labbook_record> tag containing valid JSON and no other text.
+The JSON object must have exactly these fields:
+- title: string
+- summary: string
+- objective?: string
+- hypothesis?: string
+- method: string[]
+- observations: string[]
+- decisions: string[]
+- conclusion: string
+- nextSteps: string[]
+- artifacts: string[]
+- tags: string[]
+Use empty arrays for categories not established by the conversation.`;
+
 function bullets(items: readonly string[]): string {
 	return items.length > 0 ? items.map((item) => `- ${item}`).join("\n") : "- None recorded";
 }
 
-function recordBody(params: SaveToolParams): string {
+function recordBody(params: SaveParams): string {
 	const sections = [
 		`## Summary\n\n${params.summary}`,
 		`## Objective\n\n${params.objective?.trim() || "Not specified"}`,
@@ -70,16 +93,96 @@ function recordBody(params: SaveToolParams): string {
 	return sections.join("\n\n");
 }
 
+function messageText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part): part is { type: "text"; text: string } => Boolean(part) && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string")
+		.map((part) => part.text)
+		.join("\n");
+}
+
+export function buildLabConversation(branch: readonly SessionEntry[], labId: string): string {
+	let started = false;
+	const sections: string[] = [];
+	for (const entry of branch) {
+		const event = parseLabbookEntry(entry);
+		if (event?.event === "start" && event.labId === labId) {
+			started = true;
+			continue;
+		}
+		if (!started || entry.type !== "message") continue;
+		const role = entry.message.role;
+		if (role !== "user" && role !== "assistant") continue;
+		const text = messageText(entry.message.content).trim();
+		if (text) sections.push(`${role === "user" ? "User" : "Assistant"}: ${text}`);
+	}
+	const conversation = sections.join("\n\n");
+	if (conversation.length <= MAX_CONVERSATION_CHARS) return conversation;
+	return `[Earlier Lab discussion omitted]\n${conversation.slice(-MAX_CONVERSATION_CHARS)}`;
+}
+
+export function parsePreparedRecord(text: string): SaveParams {
+	const match = /<labbook_record>([\s\S]*?)<\/labbook_record>/i.exec(text);
+	if (!match) throw new Error("The preparation model did not return <labbook_record> JSON");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(match[1].trim());
+	} catch (error) {
+		throw new Error(`The preparation model returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!Value.Check(SaveSchema, parsed)) {
+		throw new Error("The preparation model returned a record that does not match the required schema");
+	}
+	return parsed as SaveParams;
+}
+
+async function prepareRecord(
+	ctx: ExtensionCommandContext,
+	state: LabbookActivityState,
+	guidance: string,
+): Promise<SaveParams> {
+	if (!ctx.model) throw new Error("No model is selected for preparing the Lab record");
+	const conversation = buildLabConversation(ctx.sessionManager.getBranch(), state.start.labId);
+	if (!conversation.trim()) throw new Error("The active Lab branch has no discussion to save");
+	ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", "lab:preparing"));
+	try {
+		const message: UserMessage = {
+			role: "user",
+			content: [{
+				type: "text",
+				text: `Lab type: ${state.start.kind}\nLab topic: ${state.start.topic}\n${guidance ? `Additional guidance: ${guidance}\n` : ""}\nConversation:\n${conversation}`,
+			}],
+			timestamp: Date.now(),
+		};
+		const response = await ctx.modelRegistry.complete(
+			ctx.model,
+			{ systemPrompt: EXTRACTION_PROMPT, messages: [message] },
+			{},
+		);
+		if (response.stopReason === "error") throw new Error(response.errorMessage || "Record preparation failed");
+		if (response.stopReason === "aborted") throw new Error("Record preparation was aborted");
+		const text = response.content
+			.filter((part): part is { type: "text"; text: string } => part.type === "text")
+			.map((part) => part.text)
+			.join("\n");
+		return parsePreparedRecord(text);
+	} finally {
+		updateStatus(ctx);
+	}
+}
+
 function updateStatus(ctx: ExtensionContext): void {
 	const state = deriveActiveBranchState(ctx);
-	if (!state) {
-		ctx.ui.setStatus(STATUS_KEY, undefined);
-		return;
-	}
 	ctx.ui.setStatus(
 		STATUS_KEY,
-		ctx.ui.theme.fg("accent", `lab:${state.start.kind}:${state.status}`),
+		state ? ctx.ui.theme.fg("accent", `lab:${state.start.kind}:${state.status}`) : undefined,
 	);
+}
+
+function removeLegacyTool(pi: ExtensionAPI): void {
+	const tools = pi.getActiveTools();
+	if (tools.includes(LEGACY_TOOL_NAME)) pi.setActiveTools(tools.filter((name) => name !== LEGACY_TOOL_NAME));
 }
 
 function help(ctx: ExtensionContext): void {
@@ -128,124 +231,6 @@ async function returnToAnchor(
 }
 
 export default function piLabbook(pi: ExtensionAPI): void {
-	const settledWaiters = new Set<(settled: boolean) => void>();
-
-	function waitForNextAgentSettled(timeoutMs = 180_000): Promise<boolean> {
-		return new Promise((resolvePromise) => {
-			let finished = false;
-			const finish = (settled: boolean) => {
-				if (finished) return;
-				finished = true;
-				clearTimeout(timer);
-				settledWaiters.delete(finish);
-				resolvePromise(settled);
-			};
-			const timer = setTimeout(() => finish(false), timeoutMs);
-			settledWaiters.add(finish);
-		});
-	}
-
-	function syncLabTool(ctx: ExtensionContext): void {
-		const active = Boolean(deriveActiveBranchState(ctx));
-		const tools = pi.getActiveTools();
-		const hasTool = tools.includes(TOOL_NAME);
-		if (active && !hasTool) pi.setActiveTools([...tools, TOOL_NAME]);
-		if (!active && hasTool) pi.setActiveTools(tools.filter((name) => name !== TOOL_NAME));
-	}
-
-	pi.registerTool({
-		name: TOOL_NAME,
-		label: "Save Labbook Record",
-		description: "Save and publish the active Lab discussion. Call exactly once, and only after /lab save created a pending save request.",
-		promptSnippet: "Finalize the active Lab discussion as a structured record",
-		promptGuidelines: [
-			"Use labbook_save only when a hidden Lab context says that /lab save is pending.",
-			"Call labbook_save exactly once and as the only tool call in that assistant message.",
-			"Distinguish observations, decisions, conclusions, and next steps; do not invent missing facts.",
-		],
-		parameters: SaveSchema,
-		executionMode: "sequential",
-		async execute(_toolCallId, rawParams, signal, _onUpdate, ctx) {
-			const state = deriveActiveBranchState(ctx);
-			if (!state || state.status !== "save_requested" || state.latest.event !== "save_requested") {
-				throw new Error("No pending /lab save request exists on the active branch");
-			}
-			if (signal?.aborted) throw new Error("Labbook save was aborted");
-			const request = state.latest as LabbookSaveRequestedEvent;
-			const params = rawParams as SaveToolParams;
-			const endedAt = new Date().toISOString();
-			const recordInput: LabSaveParams = {
-				labId: state.start.labId,
-				kind: state.start.kind,
-				title: params.title,
-				startedAt: state.start.startedAt,
-				endedAt,
-				summary: params.summary,
-				tags: params.tags,
-				body: recordBody(params),
-				metadata: {
-					workspace: state.start.workspace,
-					pi_session: state.start.sessionId,
-					pi_anchor: state.start.anchorId,
-				},
-			};
-			try {
-				const config = loadConfig();
-				const record = createLabRecord(recordInput);
-				const markdown = renderLabRecord(record);
-				const result = await publishRecord(pi, ctx, config, {
-					relativePath: record.relativePath,
-					markdown,
-					title: record.title,
-					labId: state.start.labId,
-					sessionId: state.start.sessionId,
-				}, signal);
-				if (result.status === "declined") {
-					appendEvent(pi, {
-						event: "save_declined",
-						labId: state.start.labId,
-						requestId: request.requestId,
-						declinedAt: new Date().toISOString(),
-					});
-					return {
-						content: [{ type: "text" as const, text: "The user declined publication; the Lab branch remains active." }],
-						details: { status: "declined", labId: state.start.labId },
-						terminate: true,
-					};
-				}
-				const saved: LabbookSavedEvent = {
-					version: LABBOOK_STATE_VERSION,
-					event: "saved",
-					labId: state.start.labId,
-					requestId: request.requestId,
-					relativePath: result.relativePath,
-					commit: result.commit,
-					pushed: result.pushed,
-					savedAt: endedAt,
-				};
-				pi.appendEntry(LABBOOK_ENTRY_TYPE, saved);
-				const pushNote = result.pushed ? "and pushed to GitHub" : "as a local commit; push is pending";
-				return {
-					content: [{
-						type: "text" as const,
-						text: `Saved ${result.relativePath} in commit ${result.commit.slice(0, 12)} ${pushNote}.${result.pushError ? ` ${result.pushError}` : ""}`,
-					}],
-					details: { ...saved, pushError: result.pushError },
-					terminate: true,
-				};
-			} catch (error) {
-				appendEvent(pi, {
-					event: "save_failed",
-					labId: state.start.labId,
-					requestId: request.requestId,
-					message: error instanceof Error ? error.message : String(error),
-					failedAt: new Date().toISOString(),
-				});
-				throw error;
-			}
-		},
-	});
-
 	pi.registerCommand("lab", {
 		description: "Discuss and publish branch-isolated notes, memories, and experiment records",
 		getArgumentCompletions: (prefix) => ["start experiment ", "start note ", "start memory ", "save", "cancel", "status", "config"]
@@ -295,7 +280,7 @@ export default function piLabbook(pi: ExtensionAPI): void {
 					workspace: ctx.cwd,
 					sessionId: ctx.sessionManager.getSessionId(),
 				});
-				syncLabTool(ctx);
+				removeLegacyTool(pi);
 				updateStatus(ctx);
 				pi.sendUserMessage(
 					`开始一段独立的 Lab 讨论。类型：${parsed.kind}。主题：${parsed.topic}。请先帮助我澄清目标和已知信息，一次只推进一个清晰问题；在我执行 /lab save 前不要写入或推送任何记录。`,
@@ -305,7 +290,7 @@ export default function piLabbook(pi: ExtensionAPI): void {
 
 			if (command === "save") {
 				await ctx.waitForIdle();
-				const state = deriveActiveBranchState(ctx);
+				let state = deriveActiveBranchState(ctx);
 				if (!state) {
 					ctx.ui.notify("No active Lab discussion on this branch.", "warning");
 					return;
@@ -314,44 +299,86 @@ export default function piLabbook(pi: ExtensionAPI): void {
 					ctx.ui.notify("This Lab discussion has already been saved.", "info");
 					return;
 				}
-				if (state.status === "save_requested") {
+				let request: LabbookSaveRequestedEvent;
+				if (state.status === "save_requested" && state.latest.event === "save_requested") {
+					request = state.latest;
 					ctx.ui.notify("Retrying the pending Lab save request.", "info");
 				} else {
-					appendEvent(pi, {
+					request = {
+						version: LABBOOK_STATE_VERSION,
 						event: "save_requested",
 						labId: state.start.labId,
 						requestId: randomUUID(),
 						requestedAt: new Date().toISOString(),
 						...(remainder ? { guidance: remainder } : {}),
-					});
+					};
+					pi.appendEntry(LABBOOK_ENTRY_TYPE, request);
+					state = deriveActiveBranchState(ctx) ?? state;
 				}
-				const settled = waitForNextAgentSettled();
-				pi.sendUserMessage(
-					`请完成当前 Lab 记录并调用 ${TOOL_NAME}，且这一轮只调用该工具一次。忠实记录事实，不要补造信息。${remainder ? `额外要求：${remainder}` : ""}`,
-				);
-				const didSettle = await settled;
-				let updated = deriveActiveBranchState(ctx);
-				if (updated?.status === "save_requested" && updated.latest.event === "save_requested") {
+
+				try {
+					const prepared = await prepareRecord(ctx, state, remainder || request.guidance || "");
+					const endedAt = new Date().toISOString();
+					const input: LabSaveParams = {
+						labId: state.start.labId,
+						kind: state.start.kind,
+						title: prepared.title,
+						startedAt: state.start.startedAt,
+						endedAt,
+						summary: prepared.summary,
+						tags: prepared.tags,
+						body: recordBody(prepared),
+						metadata: {
+							workspace: state.start.workspace,
+							pi_session: state.start.sessionId,
+							pi_anchor: state.start.anchorId,
+						},
+					};
+					const config = loadConfig();
+					const record = createLabRecord(input);
+					const result = await publishRecord(pi, ctx, config, {
+						relativePath: record.relativePath,
+						markdown: renderLabRecord(record),
+						title: record.title,
+						labId: state.start.labId,
+						sessionId: state.start.sessionId,
+					});
+					if (result.status === "declined") {
+						appendEvent(pi, {
+							event: "save_declined",
+							labId: state.start.labId,
+							requestId: request.requestId,
+							declinedAt: new Date().toISOString(),
+						});
+						ctx.ui.notify("Publication was declined; staying in the Lab branch.", "info");
+						return;
+					}
+					const saved: LabbookSavedEvent = {
+						version: LABBOOK_STATE_VERSION,
+						event: "saved",
+						labId: state.start.labId,
+						requestId: request.requestId,
+						relativePath: result.relativePath,
+						commit: result.commit,
+						pushed: result.pushed,
+						savedAt: endedAt,
+					};
+					pi.appendEntry(LABBOOK_ENTRY_TYPE, saved);
+					const fresh = deriveActiveBranchState(ctx);
+					if (fresh) {
+						await returnToAnchor(pi, ctx, fresh, `lab: ${fresh.start.topic} (${saved.pushed ? "pushed" : "saved locally"})`);
+					}
+					if (!saved.pushed) ctx.ui.notify(`Record committed locally; push is pending.${result.pushError ? ` ${result.pushError}` : ""}`, "warning");
+				} catch (error) {
 					appendEvent(pi, {
 						event: "save_failed",
-						labId: updated.start.labId,
-						requestId: updated.latest.requestId,
-						message: didSettle
-							? "The model did not call labbook_save"
-							: "The save turn did not settle before the extension timeout",
+						labId: state.start.labId,
+						requestId: request.requestId,
+						message: error instanceof Error ? error.message : String(error),
 						failedAt: new Date().toISOString(),
 					});
-					updated = deriveActiveBranchState(ctx);
-				}
-				if (updated?.status === "saved" && updated.latest.event === "saved") {
-					const saved = updated.latest as LabbookSavedEvent;
-					await returnToAnchor(pi, ctx, updated, `lab: ${updated.start.topic} (${saved.pushed ? "pushed" : "saved locally"})`);
-				} else if (updated?.status === "save_declined") {
-					ctx.ui.notify("Publication was declined; staying in the Lab branch.", "info");
-				} else if (updated?.status === "save_failed") {
-					ctx.ui.notify("Save failed; staying in the Lab branch so you can retry.", "warning");
-				} else {
-					ctx.ui.notify("The model did not finish the Lab save; the branch remains active.", "warning");
+					ctx.ui.notify(`Save failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+					updateStatus(ctx);
 				}
 				return;
 			}
@@ -363,13 +390,11 @@ export default function piLabbook(pi: ExtensionAPI): void {
 					ctx.ui.notify("No active Lab discussion on this branch.", "warning");
 					return;
 				}
-				if (state.status !== "saved") {
-					const confirmed = await ctx.ui.confirm(
-						"Cancel Lab discussion?",
-						"No record will be written. The discussion remains available in /tree.",
-					);
-					if (!confirmed) return;
-				}
+				const confirmed = await ctx.ui.confirm(
+					"Cancel Lab discussion?",
+					"No record will be written. The discussion remains available in /tree.",
+				);
+				if (!confirmed) return;
 				appendEvent(pi, {
 					event: "cancelled",
 					labId: state.start.labId,
@@ -379,7 +404,6 @@ export default function piLabbook(pi: ExtensionAPI): void {
 				const navigated = await returnToAnchor(pi, ctx, state, `lab: ${state.start.topic} (cancelled)`);
 				if (!navigated) {
 					pi.appendEntry(LABBOOK_ENTRY_TYPE, state.start);
-					syncLabTool(ctx);
 					updateStatus(ctx);
 				}
 				return;
@@ -419,29 +443,22 @@ export default function piLabbook(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", async (_event, ctx) => {
 		const state = deriveActiveBranchState(ctx);
 		if (!state) return;
-		const savePending = state.status === "save_requested";
 		return {
 			message: {
 				customType: "pi-labbook-context",
 				display: false,
-				content: `[PI LABBOOK MODE]\nLab ID: ${state.start.labId}\nType: ${state.start.kind}\nTopic: ${state.start.topic}\nStatus: ${state.status}\n\nDiscuss this topic with the user and preserve distinctions between facts, assumptions, observations, decisions, and conclusions. Ask focused follow-up questions when important information is missing. Do not write files, commit, or push with ordinary tools. ${savePending ? `A save is pending: call ${TOOL_NAME} exactly once as the only tool call.` : `Do not call ${TOOL_NAME} until /lab save is requested.`}`,
+				content: `[PI LABBOOK MODE]\nLab ID: ${state.start.labId}\nType: ${state.start.kind}\nTopic: ${state.start.topic}\nStatus: ${state.status}\n\nDiscuss this topic with the user and preserve distinctions between facts, assumptions, observations, decisions, and conclusions. Ask focused follow-up questions when important information is missing. Do not write files, commit, or push with ordinary tools. /lab save is handled directly by the extension and does not require a model-callable save tool.`,
 			},
 		};
 	});
 
-	pi.on("agent_settled", async () => {
-		for (const resolveWaiter of [...settledWaiters]) resolveWaiter(true);
-	});
 	pi.on("session_start", async (_event, ctx) => {
-		syncLabTool(ctx);
+		removeLegacyTool(pi);
 		updateStatus(ctx);
 	});
 	pi.on("session_tree", async (_event, ctx) => {
-		syncLabTool(ctx);
+		removeLegacyTool(pi);
 		updateStatus(ctx);
 	});
-	pi.on("session_shutdown", async (_event, ctx) => {
-		for (const resolveWaiter of [...settledWaiters]) resolveWaiter(false);
-		ctx.ui.setStatus(STATUS_KEY, undefined);
-	});
+	pi.on("session_shutdown", async (_event, ctx) => ctx.ui.setStatus(STATUS_KEY, undefined));
 }
